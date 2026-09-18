@@ -13,16 +13,10 @@ CampusQuery is a Retrieval-Augmented Generation (RAG) system designed to answer 
    - **Data Chunking**: Splits the extracted documents into smaller chunks (1000 characters each, with 200 characters of overlap) using `RecursiveCharacterTextSplitter` so the LLM can process them effectively.
    - **Embeddings & Vector Database**: Uses the lightweight HuggingFace model `BAAI/bge-small-en-v1.5` to generate vector embeddings for the text chunks, and stores them in a local Chroma vector database (saved in the `chroma_db` directory).
 
-3. **Data Augmentation (Email PDFs)**:
-   - Built a temporary script to securely connect to the college email via IMAP.
-   - Automatically scanned and downloaded the 50 most recent PDF attachments from the inbox.
-   - Saved the documents locally into a `college_pdfs` directory to be ingested into the RAG system as additional context.
-
-4. **Execution**: 
-   The web scraping ingestion script has been successfully executed, and the vector database is fully populated with website data. The email PDFs have also been successfully downloaded and stored locally.
+3. **Execution**: 
+   The script has been successfully executed, and the vector database is fully populated and ready for the retrieval and Q&A implementation.
 
 ## Next Steps
-- Implement logic to chunk and embed the PDF files stored in `college_pdfs` into the existing `chroma_db` vector database.
 - Develop the retrieval script to search the `chroma_db` for relevant chunks based on user queries.
 - Integrate a Large Language Model (LLM) to generate answers using the retrieved context.
 
