@@ -1,4 +1,3 @@
-
 import hashlib
 from pathlib import Path
 
@@ -9,17 +8,31 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 PDF_FOLDER = Path("data/college_pdfs")
 CHROMA_DIR = "./chroma_db"
 COLLECTION_NAME = "campusquery"
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
+
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 
+# ============================================================
+# STEP 1: EXTRACT TEXT FROM PDF FILES
+# ============================================================
+
 def read_pdf_pages(pdf_path: Path) -> list[Document]:
-    """Extract usable text while preserving filename and page number."""
+    """
+    Extract text from a PDF page by page.
+
+    Metadata preserves the filename and original page number,
+    which CampusQuery uses to display source citations.
+    """
     documents = []
 
     reader = PdfReader(str(pdf_path))
@@ -31,6 +44,7 @@ def read_pdf_pages(pdf_path: Path) -> list[Document]:
             print(f"   Warning: page {page_number}: {exc}")
             continue
 
+        # Ignore pages containing almost no extractable text.
         if len(text) < 50:
             continue
 
@@ -47,45 +61,58 @@ def read_pdf_pages(pdf_path: Path) -> list[Document]:
     return documents
 
 
+# ============================================================
+# STEP 2: CREATE STABLE CHUNK IDS
+# ============================================================
+
 def stable_chunk_id(source: str, index: int, text: str) -> str:
-    """Produce a deterministic ID for each source chunk."""
+    """
+    Generate a deterministic ID for a chunk.
+
+    Identical source names, chunk positions, and content produce
+    the same ID.
+    """
     payload = f"{source}|{index}|{text}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    return hashlib.sha256(
+        payload.encode("utf-8")
+    ).hexdigest()
 
 
-def main():
-    print("=" * 60)
-    print("CAMPUSQUERY - INCREMENTAL PDF INDEXING")
-    print("=" * 60)
+# ============================================================
+# STEP 3: INITIALIZE THE VECTOR DATABASE
+# ============================================================
 
-    if not PDF_FOLDER.exists():
-        print(f"PDF folder not found: {PDF_FOLDER}")
-        return
+def open_vector_database(embeddings):
+    """
+    Open the existing ChromaDB collection.
 
-    pdf_files = sorted(PDF_FOLDER.glob("*.pdf"))
+    If the collection does not exist, ChromaDB creates it.
+    Existing collections are not deleted or reset.
+    """
+    Path(CHROMA_DIR).mkdir(parents=True, exist_ok=True)
 
-    if not pdf_files:
-        print("No PDFs found.")
-        return
-
-    print(f"PDF files discovered: {len(pdf_files)}")
-
-    print("\nLoading embedding model...")
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL
-    )
-
-    # Open the existing collection; do not delete or recreate it.
-    vectorstore = Chroma(
+    return Chroma(
         collection_name=COLLECTION_NAME,
         embedding_function=embeddings,
         persist_directory=CHROMA_DIR,
     )
 
-    stored = vectorstore.get(include=["metadatas"])
+
+# ============================================================
+# STEP 4: INDEX NEW PDF DOCUMENTS
+# ============================================================
+
+def index_pdfs(vectorstore, pdf_files: list[Path]) -> dict:
+    """
+    Index PDFs that are not already represented by their source
+    filename in the existing ChromaDB collection.
+    """
+    stored_data = vectorstore.get(include=["metadatas"])
+
     existing_sources = {
         str(metadata["source"]).casefold()
-        for metadata in (stored.get("metadatas") or [])
+        for metadata in (stored_data.get("metadatas") or [])
         if metadata and metadata.get("source")
     }
 
@@ -95,17 +122,22 @@ def main():
         length_function=len,
     )
 
-    indexed_files = 0
-    skipped_files = 0
-    failed_files = 0
-    total_chunks = 0
+    stats = {
+        "indexed": 0,
+        "skipped": 0,
+        "failed": 0,
+        "empty": 0,
+        "pages": 0,
+        "chunks": 0,
+    }
 
     for pdf_path in pdf_files:
         source = pdf_path.name
 
+        # Skip files already represented in the database.
         if source.casefold() in existing_sources:
             print(f"\nAlready indexed; skipping: {source}")
-            skipped_files += 1
+            stats["skipped"] += 1
             continue
 
         print(f"\nProcessing: {source}")
@@ -116,56 +148,172 @@ def main():
             if not pages:
                 print(
                     "   No usable text extracted. "
-                    "This PDF may be scanned and need OCR."
+                    "This file may be scanned or image-based."
                 )
+                stats["empty"] += 1
                 continue
 
             chunks = splitter.split_documents(pages)
 
             if not chunks:
-                print("   No chunks generated; skipping.")
+                print("   No chunks generated.")
+                stats["empty"] += 1
                 continue
 
-            ids = [
-                stable_chunk_id(source, index, chunk.page_content)
+            chunk_ids = [
+                stable_chunk_id(
+                    source,
+                    index,
+                    chunk.page_content,
+                )
                 for index, chunk in enumerate(chunks)
             ]
 
-            # Explicit deterministic IDs avoid duplicates when the same
-            # chunks are submitted again to this collection.
+            # Add new chunks to the existing collection.
+            # Explicit IDs help prevent duplicate IDs.
             vectorstore.add_documents(
                 documents=chunks,
-                ids=ids,
+                ids=chunk_ids,
             )
 
             existing_sources.add(source.casefold())
-            indexed_files += 1
-            total_chunks += len(chunks)
 
-            print(
-                f"   Pages extracted: {len(pages)} | "
-                f"Chunks indexed: {len(chunks)}"
-            )
+            stats["indexed"] += 1
+            stats["pages"] += len(pages)
+            stats["chunks"] += len(chunks)
+
+            print(f"   Pages extracted: {len(pages)}")
+            print(f"   Chunks indexed: {len(chunks)}")
 
         except Exception as exc:
-            failed_files += 1
-            print(f"   ERROR: {exc}")
+            stats["failed"] += 1
+            print(f"   ERROR processing {source}: {exc}")
 
-    print("\n" + "=" * 60)
-    print("INDEXING SUMMARY")
-    print("=" * 60)
-    print(f"New files indexed: {indexed_files}")
-    print(f"Already indexed files skipped: {skipped_files}")
-    print(f"Files with errors: {failed_files}")
-    print(f"New chunks submitted: {total_chunks}")
+    return stats
+
+
+# ============================================================
+# STEP 5: VERIFY THE VECTOR DATABASE
+# ============================================================
+
+def test_vector_database(vectorstore):
+    """Run a sample retrieval query against the collection."""
+    print("\nTesting vector database retrieval...")
+
+    test_query = "CAT 1 examination schedule"
 
     try:
-        final_count = vectorstore._collection.count()
-        print(f"Total chunks in ChromaDB: {final_count}")
-    except Exception as exc:
-        print(f"Could not read collection count: {exc}")
+        results = vectorstore.similarity_search(
+            test_query,
+            k=3,
+        )
 
-    print("\nIndexing finished.")
+        print(f"\nTest query: {test_query}")
+
+        if not results:
+            print("No results returned.")
+            return
+
+        for index, result in enumerate(results, start=1):
+            print(f"\n--- Result {index} ---")
+            print(f"Source: {result.metadata.get('source', 'Unknown')}")
+            print(f"Page: {result.metadata.get('page', 'Unknown')}")
+            print(f"Text: {result.page_content[:350]}")
+
+    except Exception as exc:
+        print(f"Retrieval test failed: {exc}")
+
+
+# ============================================================
+# STEP 6: MAIN
+# ============================================================
+
+def main():
+    print("=" * 65)
+    print("       CAMPUSQUERY - INCREMENTAL PDF INDEXING")
+    print("=" * 65)
+
+    # Validate the input directory.
+    if not PDF_FOLDER.exists():
+        print(f"\nERROR: PDF folder not found: {PDF_FOLDER}")
+        print("Run this script from the CampusQuery project root.")
+        return
+
+    pdf_files = sorted(
+        path
+        for path in PDF_FOLDER.glob("*.pdf")
+        if path.is_file()
+    )
+
+    if not pdf_files:
+        print(f"\nNo PDF files found in {PDF_FOLDER}")
+        return
+
+    print(f"\nPDF directory: {PDF_FOLDER.resolve()}")
+    print(f"PDF files discovered: {len(pdf_files)}")
+
+    # Initialize the embedding model.
+    print(f"\nLoading embedding model: {EMBEDDING_MODEL}")
+
+    try:
+        embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL
+        )
+    except Exception as exc:
+        print(f"Could not load embedding model: {exc}")
+        return
+
+    print("Embedding model loaded.")
+
+    # Open the existing database.
+    try:
+        vectorstore = open_vector_database(embeddings)
+    except Exception as exc:
+        print(f"Could not open ChromaDB: {exc}")
+        return
+
+    try:
+        chunks_before = vectorstore._collection.count()
+    except Exception:
+        chunks_before = None
+
+    print(f"Database directory: {Path(CHROMA_DIR).resolve()}")
+
+    if chunks_before is not None:
+        print(f"Chunks before indexing: {chunks_before}")
+
+    # Index new files.
+    stats = index_pdfs(vectorstore, pdf_files)
+
+    # Report final collection count.
+    try:
+        chunks_after = vectorstore._collection.count()
+    except Exception:
+        chunks_after = None
+
+    print("\n" + "=" * 65)
+    print("                 INDEXING SUMMARY")
+    print("=" * 65)
+
+    print(f"PDF files discovered: {len(pdf_files)}")
+    print(f"New PDFs indexed: {stats['indexed']}")
+    print(f"Already indexed PDFs skipped: {stats['skipped']}")
+    print(f"PDFs with no usable text: {stats['empty']}")
+    print(f"PDFs with processing errors: {stats['failed']}")
+    print(f"Pages extracted from new PDFs: {stats['pages']}")
+    print(f"New chunks submitted: {stats['chunks']}")
+
+    if chunks_after is not None:
+        print(f"Total chunks now in ChromaDB: {chunks_after}")
+
+    print(f"Database: {Path(CHROMA_DIR).resolve()}")
+
+    # Test retrieval if indexing completed without file errors.
+    if chunks_after is not None and chunks_after > 0:
+        test_vector_database(vectorstore)
+
+    print("\nIndexing process finished.")
+    print("=" * 65)
 
 
 if __name__ == "__main__":
